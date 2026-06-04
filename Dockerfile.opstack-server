@@ -1,0 +1,37 @@
+# helios opstack consensus server — serves sequencer-signed unsafe heads
+# (/latest, /chain_id) for helios opstack light clients. Self-hosted
+# replacement for the public operationsolarstorm.org feeds.
+FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+RUN cargo build --release -p helios-opstack --bin opstack-server
+
+FROM debian:bookworm-slim@sha256:78d2f66e0fec9e5a39fb2c72ea5e052b548df75602b5215ed01a17171529f706
+
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -r -s /bin/false helios
+
+WORKDIR /app
+COPY --from=builder /app/target/release/opstack-server /app/opstack-server
+RUN chown helios:helios /app/opstack-server
+
+USER helios
+
+# HTTP API (/latest, /chain_id) + libp2p gossip
+EXPOSE 8080 9876/tcp 9876/udp
+
+ENTRYPOINT ["/app/opstack-server"]
