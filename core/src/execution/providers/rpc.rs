@@ -11,7 +11,7 @@ use alloy::{
     providers::{Provider, ProviderBuilder, RootProvider},
     rlp,
     rpc::{
-        client::ClientBuilder,
+        client::{ClientBuilder, RpcClient},
         types::{AccessListItem, Filter, FilterBlockOption, Log},
     },
     transports::layers::RetryBackoffLayer,
@@ -66,6 +66,18 @@ pub struct RpcExecutionProvider<N: NetworkSpec, B: BlockProvider<N>, H: Historic
     historical_provider: Option<H>,
 }
 
+/// Builds the upstream RPC client. On native targets outbound requests carry the
+/// active span's trace context, so the upstream's own spans continue the caller's
+/// trace rather than starting new ones.
+fn build_rpc_client(rpc_url: Url) -> RpcClient {
+    let builder = ClientBuilder::default().layer(RetryBackoffLayer::new(100, 50, 300));
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = builder.layer(super::trace::TraceInjectLayer);
+
+    builder.http(rpc_url)
+}
+
 impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> ExecutionProvider<N>
     for RpcExecutionProvider<N, B, H>
 {
@@ -75,9 +87,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>>
     RpcExecutionProvider<N, B, H>
 {
     pub fn new(rpc_url: Url, block_provider: B) -> RpcExecutionProvider<N, B, ()> {
-        let client = ClientBuilder::default()
-            .layer(RetryBackoffLayer::new(100, 50, 300))
-            .http(rpc_url);
+        let client = build_rpc_client(rpc_url);
 
         let provider = ProviderBuilder::<_, _, N>::default().connect_client(client);
 
@@ -93,9 +103,7 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>>
         block_provider: B,
         historical_provider: H,
     ) -> Self {
-        let client = ClientBuilder::default()
-            .layer(RetryBackoffLayer::new(100, 50, 300))
-            .http(rpc_url);
+        let client = build_rpc_client(rpc_url);
 
         let provider = ProviderBuilder::<_, _, N>::default().connect_client(client);
 
@@ -202,6 +210,17 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>>
 impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> AccountProvider<N>
     for RpcExecutionProvider<N, B, H>
 {
+    // An ACL check drives one of these per account it touches, and each fetches a
+    // proof plus, on a first sighting, the code. Naming them individually is what
+    // separates proof fetching from proof verification in a request's timeline.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        tracing::instrument(
+            name = "helios.get_account",
+            skip_all,
+            fields(address = %address, slots = slots.len(), with_code)
+        )
+    )]
     async fn get_account(
         &self,
         address: Address,
@@ -209,25 +228,45 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Account
         with_code: bool,
         block_id: BlockId,
     ) -> Result<Account> {
+        // get_account showed 90-170ms of self-time against only ~17ms of
+        // upstream RPC underneath it, and the span had no children besides the
+        // proof fetch -- so the majority of an ACL check was unattributed.
+        // Each step below is spanned so that time resolves into block
+        // resolution, proof fetching, verification CPU and the optional code
+        // fetch, rather than one opaque number.
+        use tracing::Instrument;
+
         let block = self
             .get_block(block_id, false)
+            .instrument(tracing::info_span!("helios.get_block"))
             .await?
             .ok_or(eyre!("block not found"))?;
 
-        let proof = self
-            .provider
-            .get_proof(address, slots.to_vec())
-            .block_id(block.header().hash().into())
-            .await?;
+        let proof = async {
+            self.provider
+                .get_proof(address, slots.to_vec())
+                .block_id(block.header().hash().into())
+                .await
+        }
+        .instrument(tracing::info_span!("helios.get_proof", slots = slots.len()))
+        .await?;
 
-        verify_account_proof(&proof, block.header().state_root())?;
-        verify_storage_proof(&proof)?;
+        // Synchronous keccak/RLP over the trie path. Entered rather than
+        // instrumented because there is no await inside.
+        {
+            let _v = tracing::info_span!("helios.verify_proof").entered();
+            verify_account_proof(&proof, block.header().state_root())?;
+            verify_storage_proof(&proof)?;
+        }
 
         let code = if with_code {
             if proof.code_hash == KECCAK_EMPTY || proof.code_hash == B256::ZERO {
                 Some(Bytes::new())
             } else {
-                let code = self.provider.get_code_at(address).await?;
+                let code = async { self.provider.get_code_at(address).await }
+                    .instrument(tracing::info_span!("helios.get_code"))
+                    .await?;
+                let _v = tracing::info_span!("helios.verify_code").entered();
                 verify_code_hash_proof(&proof, &code)?;
                 Some(code)
             }

@@ -27,11 +27,16 @@ use crate::client::api::HeliosApi;
 
 pub type Handle = ServerHandle;
 
+mod trace;
+
 pub async fn start<N: NetworkSpec>(
     client: Arc<dyn HeliosApi<N>>,
     addr: SocketAddr,
 ) -> Result<ServerHandle> {
-    let server = ServerBuilder::default().build(addr).await?;
+    let server = ServerBuilder::default()
+        .set_middleware(tower::ServiceBuilder::new().layer(trace::TraceContextLayer))
+        .build(addr)
+        .await?;
     let rpc = JsonRpc {
         client,
         phantom: PhantomData,

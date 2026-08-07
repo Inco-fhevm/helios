@@ -189,7 +189,16 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
         block_id: BlockId,
         state_overrides: Option<StateOverride>,
     ) -> Result<Bytes> {
-        self.check_blocktag_age(&block_id).await?;
+        // Splits an eth_call into its two halves. check_blocktag_age resolves
+        // `latest`, which on a lagging head is where a call can stall; transact
+        // is the local EVM run plus every account fetch it triggers. Both were
+        // previously inside the opaque `helios.rpc` span, which is why ~70% of
+        // an ACL check could not be attributed to anything.
+        use tracing::Instrument;
+
+        async { self.check_blocktag_age(&block_id).await }
+            .instrument(tracing::info_span!("helios.check_head_age"))
+            .await?;
         let (result, ..) = N::transact(
             tx,
             false,
@@ -199,6 +208,7 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
             block_id,
             state_overrides,
         )
+        .instrument(tracing::info_span!("helios.evm_transact"))
         .await?;
 
         let res = match result {
