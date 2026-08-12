@@ -43,9 +43,14 @@ jsonrpsee = { version = "0.19.0", features = [
     "macros",
 ] }
 openssl.workspace = true
-opentelemetry = "0.32"
+# Wide ranges so downstream workspaces can resolve one otel minor lower. The
+# trace-context code here only uses APIs stable across these versions
+# (propagation::{Extractor,Injector}, global::get_text_map_propagator,
+# OpenTelemetrySpanExt). This repo's own lockfile keeps resolving to the
+# newest in range, so builds from this repo are unaffected.
+opentelemetry = ">=0.31, <0.33"
 tower = "0.4"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = ">=0.32, <0.34"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4.33"
