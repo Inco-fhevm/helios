@@ -36,8 +36,36 @@ use helios_verifiable_api_types::{TransactionResponse, *};
 
 #[derive(Clone)]
 pub struct ApiService<N: NetworkSpec> {
-    rpc_url: String,
     rpc: RootProvider<N>,
+    /// Built ONCE and shared by every request.
+    ///
+    /// This used to be constructed inside `get_execution_hint`, so each request
+    /// got a brand-new HTTP client -- a new connection pool, fresh TCP+TLS to
+    /// the upstream on every call -- and a brand-new empty cache, so nothing was
+    /// ever reused between requests. revm's `Database` is synchronous, so the
+    /// hint's EVM aborts on the first missing account, fetches one, and replays
+    /// the whole transaction: roughly ten strictly serial upstream round trips
+    /// per hint. Paying connect+TLS on each of them against a cold cache is what
+    /// made `vapi.hint_evm_transact` 4.8s in production traces, against 43ms
+    /// when it happened to be warm.
+    ///
+    /// Sharing is safe: every key in `Cache` is either content-addressed (code
+    /// by code_hash, storage by storage_hash) or scoped to an immutable block
+    /// hash (accounts by (address, block_hash)), so a hit is always identical to
+    /// a fresh fetch. The LRUs are fixed-capacity, so it cannot grow unbounded.
+    exec_provider: Arc<CachingProvider<RpcExecutionProvider<N, BlockCache<N>, ()>>>,
+    /// Chain ID is immutable, and was being fetched over the network on every
+    /// single hint -- measured at 43ms in one trace.
+    chain_id: Arc<tokio::sync::OnceCell<u64>>,
+}
+
+impl<N: NetworkSpec> ApiService<N> {
+    async fn chain_id_cached(&self) -> Result<u64> {
+        self.chain_id
+            .get_or_try_init(|| async { self.rpc.get_chain_id().await.map_err(Report::from) })
+            .await
+            .copied()
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -50,9 +78,21 @@ impl<N: NetworkSpec> VerifiableApi<N> for ApiService<N> {
 
         let provider = ProviderBuilder::<_, _, N>::default().connect_client(client);
 
+        // Parsed here, once. The hint path used to do `self.rpc_url.parse().unwrap()`
+        // per request -- a panic path inside a handler for a URL this constructor
+        // has already validated.
+        let exec_provider = Arc::new(CachingProvider::new(RpcExecutionProvider::<
+            N,
+            BlockCache<N>,
+            (),
+        >::new(
+            rpc_url.clone(), BlockCache::<N>::new()
+        )));
+
         Self {
-            rpc_url: rpc_url.to_string(),
             rpc: provider,
+            exec_provider,
+            chain_id: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -86,14 +126,23 @@ impl<N: NetworkSpec> VerifiableApi<N> for ApiService<N> {
             .map(|key| (*key).into())
             .collect::<Vec<_>>();
 
-        let proof = self
-            .rpc
-            .get_proof(address, storage_keys)
-            .block_id(block_id)
-            .await?;
+        use tracing::Instrument;
+
+        let proof = async {
+            self.rpc
+                .get_proof(address, storage_keys)
+                .block_id(block_id)
+                .await
+        }
+        .instrument(tracing::info_span!("vapi.acct_get_proof"))
+        .await?;
 
         let code = if include_code {
-            Some(self.rpc.get_code_at(address).block_id(block_id).await?)
+            Some(
+                async { self.rpc.get_code_at(address).block_id(block_id).await }
+                    .instrument(tracing::info_span!("vapi.acct_get_code"))
+                    .await?,
+            )
         } else {
             None
         };
@@ -217,38 +266,78 @@ impl<N: NetworkSpec> VerifiableApi<N> for ApiService<N> {
         validate_tx: bool,
         block_id: Option<BlockId>,
     ) -> Result<ExtendedAccessListResponse> {
-        let block_id = block_id.unwrap_or_default();
-        let block = self
-            .rpc
-            .get_block(block_id)
-            .hashes()
-            .await?
-            .ok_or_eyre(ExecutionError::BlockNotFound(block_id))?;
+        use tracing::Instrument;
+
+        // Top-level span so the time spent deserializing the request, looking up
+        // the cached chain id, and any other per-hint setup work is visible in
+        // Tempo instead of appearing as an uninstrumented gap before
+        // vapi.hint_get_block / vapi.hint_evm_transact.
+        let setup_span = tracing::info_span!("vapi.hint_evm_setup");
+        async {
+            let block_id = block_id.unwrap_or_default();
+            let block = async {
+            self.rpc
+                .get_block(block_id)
+                .hashes()
+                .await?
+                .ok_or_eyre(ExecutionError::BlockNotFound(block_id))
+        }
+        .instrument(tracing::info_span!("vapi.hint_get_block"))
+        .await?;
 
         let block_id = block.header().hash().into();
 
-        // initialize execution provider for the given block
-        let block_provider = BlockCache::<N>::new();
-        let provider = RpcExecutionProvider::<N, BlockCache<N>, ()>::new(
-            self.rpc_url.parse().unwrap(),
-            block_provider,
-        );
-        let provider = CachingProvider::new(provider);
-        provider.push_block(block, block_id).await;
+        // Shared provider: one connection pool and one warm cache for the whole
+        // process, instead of a fresh client and an empty cache per request.
+        //
+        // Spanned because the region between hint_get_block ending and
+        // hint_evm_transact starting showed ~22ms with nothing covering it.
+        let provider = self.exec_provider.clone();
+        async { provider.push_block(block, block_id).await }
+            .instrument(tracing::info_span!("vapi.hint_push_block"))
+            .await;
 
-        // call EVM with the transaction, collect accounts and storage keys
+        // The EVM run. Every account it touches is fetched from our upstream
+        // through RpcExecutionProvider, which is itself spanned in helios-core
+        // (helios.get_account / get_proof / get_code), so those appear beneath
+        // this span once the server exports.
+        //
+        // accounts.len() is the number the hint returns. Compare it against how
+        // many helios.vapi_get_account calls the CLIENT makes afterwards: every
+        // one of those is an account this hint failed to predict, and each costs
+        // a full WAN round trip. One request was measured doing 13 of them for
+        // 6.7s -- 79% of the whole decrypt.
+        let chain_id = async { self.chain_id_cached().await }
+            .instrument(tracing::info_span!("vapi.hint_chain_id"))
+            .await?;
+
+        // The hint is only useful if this EVM behaves like the caller's EVM.
+        // Upstream passed ForkSchedule::default() here, which sets EVERY fork
+        // timestamp to u64::MAX -- i.e. no fork activated, pre-Frontier
+        // semantics -- while helios executes with the real superchain schedule
+        // (opstack/src/config.rs: SuperchainForkSchedule::sepolia()). The two
+        // executions diverge, so the access list we return omits accounts the
+        // caller's run actually touches. Each omission costs the caller a full
+        // WAN round trip: measured 10 stragglers at ~91ms after a hint that
+        // predicted only 4.
+        let fork_schedule = superchain_forks(chain_id);
         let (.., accounts) = N::transact(
             &tx,
             validate_tx,
-            Arc::new(provider),
-            self.rpc.get_chain_id().await?,
-            ForkSchedule::default(),
+            provider,
+            chain_id,
+            fork_schedule,
             block_id,
             None, // state overrides not supported for execution hints
         )
+        .instrument(tracing::info_span!("vapi.hint_evm_transact"))
         .await?;
 
-        Ok(ExtendedAccessListResponse { accounts })
+        tracing::Span::current().record("accounts", accounts.len());
+            Ok(ExtendedAccessListResponse { accounts })
+        }
+        .instrument(setup_span)
+        .await
     }
 
     async fn chain_id(&self) -> Result<ChainIdResponse> {
@@ -354,5 +443,21 @@ impl<N: NetworkSpec> ApiService<N> {
         }
 
         Ok(receipt_response)
+    }
+}
+
+/// Fork schedule for an OP-stack chain, by chain id.
+///
+/// The verifiable-api server is started with only `--execution-rpc`, so it has
+/// no network name to look up; chain id is the one identifier it can obtain
+/// (and it already fetches it for the EVM). Sepolia-side superchain chains take
+/// the sepolia schedule, everything else the mainnet one -- matching the tables
+/// in opstack/src/config.rs.
+fn superchain_forks(chain_id: u64) -> ForkSchedule {
+    use helios_opstack::config::SuperchainForkSchedule;
+    match chain_id {
+        // OP Sepolia, Base Sepolia, Unichain Sepolia, Worldchain Sepolia
+        11155420 | 84532 | 1301 | 4801 => SuperchainForkSchedule::sepolia(),
+        _ => SuperchainForkSchedule::mainnet(),
     }
 }

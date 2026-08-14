@@ -12,6 +12,10 @@ reqwest.workspace = true
 reqwest-retry.workspace = true
 reqwest-middleware.workspace = true
 async-trait.workspace = true
+tracing.workspace = true
+http = "1.1"
+opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 tokio.workspace = true
 url.workspace = true
 

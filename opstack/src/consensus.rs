@@ -27,7 +27,7 @@ use tracing::{debug, error, warn};
 use helios_consensus_core::consensus_spec::MainnetConsensusSpec;
 use helios_core::consensus::Consensus;
 use helios_core::execution::proof::{verify_account_proof, verify_mpt_proof};
-use helios_core::time::{interval, SystemTime, UNIX_EPOCH};
+use helios_core::time::{sleep, SystemTime, UNIX_EPOCH};
 use helios_ethereum::consensus::ConsensusClient as EthConsensusClient;
 
 use helios_ethereum::database::ConfigDB;
@@ -70,12 +70,36 @@ impl ConsensusClient {
         let run = wasm_bindgen_futures::spawn_local;
 
         run(async move {
-            let mut interval = interval(Duration::from_secs(1));
+            // No interval. advance() long-polls `/latest?after=<head>`, so the
+            // server holds the request until it actually has a newer block and
+            // this loop is woken by the gossip push rather than by a clock.
+            //
+            // Upstream (a16z/helios #391) ticked once a second here against an
+            // endpoint that is itself gossip-fed, which put mean 500ms of pure
+            // delay on the verified head. That head is what every ACL check
+            // reads -- compute/service.go:2358 passes LatestBlock -- so until it
+            // includes the block carrying the grant, the check runs a full proof
+            // fetch and then denies.
+            //
+            // The two sleeps below are error paths only, never the steady state:
+            //   - request failed: back off so a dead server is not hot-looped.
+            //   - request returned without advancing: the peer is an older build
+            //     that ignores `after` and answered immediately. Degrade to a
+            //     poll instead of spinning.
+            const ERR_BACKOFF: Duration = Duration::from_millis(500);
+            const NO_PROGRESS_BACKOFF: Duration = Duration::from_millis(200);
             loop {
-                if let Err(e) = inner.advance().await {
-                    error!(target: "helios::opstack", "failed to advance: {}", e);
+                let before = inner.latest_block;
+                match inner.advance().await {
+                    Err(e) => {
+                        error!(target: "helios::opstack", "failed to advance: {}", e);
+                        sleep(ERR_BACKOFF).await;
+                    }
+                    Ok(()) if inner.latest_block == before => {
+                        sleep(NO_PROGRESS_BACKOFF).await;
+                    }
+                    Ok(()) => {}
                 }
-                interval.tick().await;
             }
         });
 
@@ -131,10 +155,17 @@ struct Inner {
 
 impl Inner {
     pub async fn advance(&mut self) -> Result<()> {
-        let url = self
+        let mut url = self
             .server_url
             .join("latest")
             .map_err(|e| eyre!("Failed to construct latest URL: {}", e))?;
+        // Ask the server to hold the request until it has something newer than
+        // what we already have. A server that predates this simply ignores the
+        // parameter and answers immediately, so this stays wire-compatible.
+        if let Some(latest) = self.latest_block {
+            url.query_pairs_mut()
+                .append_pair("after", &latest.to_string());
+        }
         let commitment = reqwest::get(url)
             .await?
             .json::<SequencerCommitment>()

@@ -9,16 +9,24 @@ use schnellru::{ByLength, LruMap};
 
 use helios_common::types::Account;
 
-// Cache capacities
-// High turnover due to block updates.
-const ACCOUNTS_CACHE_SIZE: u32 = 128;
+// Cache capacities.
+//
+// These were sized for a cache owned by a single client, and on the
+// verifiable-api server for a cache that lived for one request. It is now shared
+// process-wide across concurrent requests, so the working set is larger by
+// roughly the concurrency factor: entries are keyed by (address, block_hash), a
+// 2s chain produces a new key for every account every block, and a single decrypt
+// touches ~10 accounts. At 128 entries a 16-way concurrent load evicts an account
+// before the replay loop asks for it again, which defeats the point of caching.
+const ACCOUNTS_CACHE_SIZE: u32 = 2048;
 
 // Each entry is an LRU of slots per storage root.
-const STORAGE_CACHE_SIZE: u32 = 64;
+const STORAGE_CACHE_SIZE: u32 = 512;
 const STORAGE_SLOTS_PER_ROOT_CACHE_SIZE: u32 = 256;
 
-// Code: Static and can be shared. Most valuable cache.
-const CODE_CACHE_SIZE: u32 = 256;
+// Code: content-addressed by code_hash, so entries never go stale and stay valid
+// across blocks. The most valuable cache and the cheapest to keep.
+const CODE_CACHE_SIZE: u32 = 2048;
 
 pub struct Cache {
     /// Storage proofs: content-addressed by storage_hash
@@ -100,9 +108,17 @@ impl Cache {
     }
 
     /// Get code by code hash. Hash MUST come from a verified account proof.
+    ///
+    /// `peek` under a READ lock, not `get` under a write lock. `LruMap::get`
+    /// takes `&mut self` because it bumps recency, which turned every cache hit
+    /// into an exclusive lock -- harmless for a per-request cache, a
+    /// process-wide mutex on the hottest path now that the cache is shared
+    /// across concurrent requests. The cost is that reads no longer refresh
+    /// recency, so eviction drifts towards insertion order; the capacities above
+    /// were raised to absorb that.
     pub fn get_code(&self, code_hash: B256) -> Option<Bytes> {
-        let mut code = self.code.write().unwrap_or_else(|e| e.into_inner());
-        code.get(&code_hash).cloned()
+        let code = self.code.read().unwrap_or_else(|e| e.into_inner());
+        code.peek(&code_hash).cloned()
     }
 
     /// Try to recover code for an address from any cached account entry.
@@ -154,9 +170,11 @@ impl Cache {
         slots: &[B256],
         block_hash: B256,
     ) -> Option<(EIP1186AccountProofResponse, Vec<B256>)> {
+        // Read lock + peek: see the note on get_code. A cache hit must not
+        // serialise concurrent requests behind a write lock.
         let account = {
-            let mut accounts = self.accounts.write().unwrap_or_else(|e| e.into_inner());
-            accounts.get(&(address, block_hash)).cloned()?
+            let accounts = self.accounts.read().unwrap_or_else(|e| e.into_inner());
+            accounts.peek(&(address, block_hash)).cloned()?
         };
 
         let storage_hash = account.storage_hash;
@@ -164,10 +182,10 @@ impl Cache {
         let mut missing_slots = Vec::new();
 
         {
-            let mut storage = self.storage.write().unwrap_or_else(|e| e.into_inner());
-            if let Some(storage_map) = storage.get(&storage_hash) {
+            let storage = self.storage.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(storage_map) = storage.peek(&storage_hash) {
                 for slot in slots {
-                    if let Some(proof) = storage_map.get(slot) {
+                    if let Some(proof) = storage_map.peek(slot) {
                         storage_proofs.push(proof.clone());
                     } else {
                         missing_slots.push(*slot);

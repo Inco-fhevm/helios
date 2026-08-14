@@ -1,4 +1,8 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use alloy::{
     eips::{eip1898::RpcBlockHash, BlockNumberOrTag},
@@ -52,6 +56,29 @@ pub struct EvmState<N: NetworkSpec, E: ExecutionProvider<N>> {
     pub execution: Arc<E>,
     pub state_overrides: Option<StateOverride>,
     pub phantom: PhantomData<N>,
+    /// Discovery mode: record everything that is missing in one pass instead of
+    /// aborting on the first miss.
+    ///
+    /// `access` is a single `Option`, so a normal replay can only ever surface
+    /// ONE missing account before it bails. With ~8 accounts left unpredicted
+    /// by the execution hint that becomes eight (WAN fetch + full
+    /// re-execution) cycles, strictly serialised. Measured in production at
+    /// t+560, 604, 684, 723, 778, 816, 862, 902 ms -- each starting within
+    /// 0.3ms of the previous one ending, ~340ms of a ~508ms request.
+    ///
+    /// SAFETY: while this is set, the `get_*` methods hand back zeroed
+    /// placeholders so execution can run past a miss. Those values are wrong,
+    /// so the result of a discovery replay MUST be discarded. `discover_state`
+    /// in opstack/src/evm.rs is the only caller and throws it away. Nothing is
+    /// written into `accounts` from a placeholder either, so the real replay
+    /// afterwards still fetches and verifies every account exactly as before.
+    /// If discovery guesses wrong, an over-guess only wastes a fetch and an
+    /// under-guess leaves the remainder to the existing serial loop; neither
+    /// can change the returned result.
+    pub discover: bool,
+    pub discovered_accounts: HashSet<Address>,
+    pub discovered_storage: HashSet<(Address, U256)>,
+    pub discovered_blocks: HashSet<u64>,
 }
 
 impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
@@ -68,7 +95,76 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
             access: None,
             state_overrides,
             phantom: PhantomData,
+            discover: false,
+            discovered_accounts: HashSet::new(),
+            discovered_storage: HashSet::new(),
+            discovered_blocks: HashSet::new(),
         }
+    }
+
+    /// Fetch everything a discovery pass turned up, concurrently.
+    ///
+    /// This is the whole point of discovery mode: the serial loop pays one WAN
+    /// round trip per missing account, this pays one for all of them. Returns
+    /// how many accounts were fetched so the caller can log the fan-out.
+    pub async fn fetch_discovered(&mut self) -> Result<usize> {
+        use futures::future::join_all;
+
+        // Storage misses are folded into their account fetch: get_account takes
+        // the slot list, so asking for the account and its slots is one call.
+        let mut slots_by_address: HashMap<Address, Vec<B256>> = HashMap::new();
+        for (address, slot) in self.discovered_storage.iter() {
+            slots_by_address
+                .entry(*address)
+                .or_default()
+                .push(B256::from(*slot));
+        }
+        for address in self.discovered_accounts.iter() {
+            slots_by_address.entry(*address).or_default();
+        }
+
+        let block = self.block;
+        let requests: Vec<(Address, Vec<B256>)> = slots_by_address.into_iter().collect();
+        let fetched = requests.len();
+
+        let results = join_all(requests.into_iter().map(|(address, slots)| {
+            let execution = self.execution.clone();
+            async move {
+                let account = execution
+                    .get_account(address, &slots, true, block.into())
+                    .await;
+                (address, account)
+            }
+        }))
+        .await;
+
+        for (address, account) in results {
+            // A failure here is not fatal: the account simply stays missing and
+            // the normal loop fetches it serially and surfaces the real error
+            // in context. Discovery must never be the thing that fails a
+            // request it was only meant to speed up.
+            match account {
+                Ok(account) => {
+                    self.accounts.insert(address, account);
+                }
+                Err(err) => {
+                    tracing::debug!(%address, %err, "discovery fetch failed, deferring to serial path");
+                }
+            }
+        }
+
+        let blocks: Vec<u64> = self.discovered_blocks.iter().copied().collect();
+        for number in blocks {
+            let block_id = BlockNumberOrTag::Number(number).into();
+            if let Ok(Some(block)) = self.execution.get_block(block_id, false).await {
+                self.block_hash.insert(number, block.header().hash());
+            }
+        }
+
+        self.discovered_accounts.clear();
+        self.discovered_storage.clear();
+        self.discovered_blocks.clear();
+        Ok(fetched)
     }
 
     pub async fn update_state(&mut self) -> Result<()> {
@@ -127,6 +223,22 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
             .as_ref()
             .and_then(|overrides| overrides.get(&address));
 
+        if self.discover {
+            // Discovery pass: note what is missing and keep executing so this
+            // single pass finds the rest of the working set. Placeholders are
+            // returned and the result is discarded by the caller.
+            let have_code = self
+                .accounts
+                .get(&address)
+                .map(|account| account.code.is_some())
+                .unwrap_or(false)
+                || override_opt.and_then(|o| o.code.as_ref()).is_some();
+            if !have_code {
+                self.discovered_accounts.insert(address);
+                return Ok(AccountInfo::default());
+            }
+        }
+
         if let Some(account) = self.accounts.get_mut(&address) {
             let code_is_overriden = override_opt.and_then(|o| o.code.as_ref()).is_some();
             if account.code.is_none() && !code_is_overriden {
@@ -184,6 +296,11 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
             }
         }
 
+        if self.discover {
+            self.discovered_storage.insert((address, slot));
+            return Ok(U256::ZERO);
+        }
+
         self.access = Some(StateAccess::Storage(address, slot));
         Err(DatabaseError::StateMissing)
     }
@@ -191,6 +308,9 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
     pub fn get_block_hash(&mut self, block: u64) -> Result<B256, DatabaseError> {
         if let Some(hash) = self.block_hash.get(&block) {
             Ok(*hash)
+        } else if self.discover {
+            self.discovered_blocks.insert(block);
+            Ok(B256::ZERO)
         } else {
             self.access = Some(StateAccess::BlockHash(block));
             Err(DatabaseError::StateMissing)
@@ -202,15 +322,40 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
         tx: &N::TransactionRequest,
         validate_tx: bool,
     ) -> Result<()> {
+        // Split because the caller only ever saw the total. Measured:
+        // vapi_execution_hint 748ms, of which the HTTP call accounted for
+        // to_headers 363 + body_read 302 + parse 0.15 = 665 -- leaving ~83ms
+        // unattributed on this side of the call. That is either the request
+        // construction ahead of the send or the insertion loop below, and until
+        // both are timed there is no way to tell which.
+        use tracing::Instrument;
+
+        let t_call = std::time::Instant::now();
         let account_map = self
             .execution
             .get_execution_hint(tx, validate_tx, self.block.into())
+            .instrument(tracing::info_span!("evm.hint_call"))
             .await
             .map_err(EvmError::RpcError)?;
+        let hint_call_ms = t_call.elapsed().as_secs_f64() * 1000.0;
 
-        for (address, account) in account_map {
-            self.accounts.insert(address, account);
+        let t_ins = std::time::Instant::now();
+        let mut inserted = 0usize;
+        {
+            let _g = tracing::info_span!("evm.hint_insert").entered();
+            for (address, account) in account_map {
+                self.accounts.insert(address, account);
+                inserted += 1;
+            }
         }
+        let hint_insert_ms = t_ins.elapsed().as_secs_f64() * 1000.0;
+
+        tracing::info!(
+            hint_call_ms,
+            hint_insert_ms,
+            accounts_inserted = inserted,
+            "evm prefetch_state"
+        );
 
         Ok(())
     }

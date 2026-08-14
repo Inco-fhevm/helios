@@ -11,6 +11,7 @@ use helios_common::network_spec::NetworkSpec;
 use helios_verifiable_api_types::*;
 
 pub mod http;
+pub mod trace;
 pub mod mock;
 // re-export types
 pub use helios_verifiable_api_types as types;

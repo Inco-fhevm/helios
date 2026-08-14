@@ -71,10 +71,64 @@ impl<E: ExecutionProvider<OpStack>> OpStackEvm<E> {
         let pinned_block: RpcBlockHash = block.header.hash.into();
 
         let mut db = ProofDB::new(pinned_block, self.execution.clone(), state_overrides);
-        _ = db.state.prefetch_state(tx, validate_tx).await;
+        // The result is deliberately inspected rather than dropped: a failed
+        // prefetch leaves the cache empty and turns the loop below into one
+        // upstream round trip per touched account, which is the difference
+        // between one call and ten. Dropping it made that failure silent.
+        let prefetch_t = std::time::Instant::now();
+        let prefetch_res = db.state.prefetch_state(tx, validate_tx).await;
+        let prefetch_ms = prefetch_t.elapsed().as_secs_f64() * 1000.0;
+        let prefetch_ok = prefetch_res.is_ok();
+        // Measured: prefetch_ok was false in 80/80 samples while the underlying
+        // HTTP call returned 200 with a 134 KB body. The hint is fetched, paid
+        // for, and then discarded -- so the reason has to be visible, not just
+        // the fact of failure.
+        let prefetch_err = match prefetch_res {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e}"),
+        };
+
+        // Discovery pass: find the whole working set in one replay, then fetch
+        // it concurrently, so the serial loop below has nothing left to do.
+        //
+        // The loop that follows can only ever learn about one missing account
+        // per iteration -- EvmState::access is a single Option and revm's
+        // Database trait is synchronous, so a miss has to abort the whole
+        // transaction, fetch one account, and replay from scratch. With the
+        // execution hint leaving ~8 accounts unpredicted that measured as eight
+        // strictly serial (WAN fetch + full re-execution) cycles: t+560, 604,
+        // 684, 723, 778, 816, 862, 902 ms, ~340ms of a ~508ms request.
+        //
+        // SAFETY: `discover` makes the getters return zeroed placeholders
+        // instead of aborting, so this replay executes against values that are
+        // wrong. Its result is dropped on the floor here and never inspected.
+        // Only the real loop below can produce the value we return, and it
+        // still fetches and verifies everything it uses. `access` is cleared
+        // afterwards so a placeholder miss cannot leak into it.
+        let discover_t = std::time::Instant::now();
+        db.state.discover = true;
+        {
+            let context = self.get_context(tx, &block, validate_tx);
+            let mut evm = context.with_db(&mut db).build_op();
+            let _discarded = evm.replay();
+        }
+        db.state.discover = false;
+        db.state.access = None;
+        let discovered = db.state.fetch_discovered().await.unwrap_or(0);
+        let discover_ms = discover_t.elapsed().as_secs_f64() * 1000.0;
 
         // Track iterations for debugging
         let mut iteration: u32 = 0;
+        // This loop is the whole cost of an execution hint, and until now it was
+        // one opaque span: measured at 221ms with no way to see whether that is
+        // many cheap fetches, one slow one, or EVM execution itself. Each fetch
+        // and each replay is timed separately below and the totals are reported
+        // at the end, so the 221ms resolves into counts and per-call durations.
+        let mut fetch_total_ms = 0.0f64;
+        let mut fetch_max_ms = 0.0f64;
+        let mut fetches: u32 = 0;
+        let mut replay_total_ms = 0.0f64;
+        let loop_t = std::time::Instant::now();
 
         let tx_res = loop {
             iteration += 1;
@@ -86,27 +140,69 @@ impl<E: ExecutionProvider<OpStack>> OpStackEvm<E> {
                     iteration,
                     db.state.access.as_ref().unwrap()
                 );
-                db.state
-                    .update_state()
-                    .await
-                    .map_err(|e| EvmError::Generic(e.to_string()))?;
+                let access = format!("{:?}", db.state.access.as_ref().unwrap());
+                let t = std::time::Instant::now();
+                let res = {
+                    use tracing::Instrument;
+                    db.state
+                        .update_state()
+                        .instrument(tracing::info_span!(
+                            "evm.state_fetch",
+                            iteration,
+                            access = %access
+                        ))
+                        .await
+                };
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                fetch_total_ms += ms;
+                fetches += 1;
+                if ms > fetch_max_ms {
+                    fetch_max_ms = ms;
+                }
+                res.map_err(|e| EvmError::Generic(e.to_string()))?;
             }
 
             // Create EVM after any async operations
             let context = self.get_context(tx, &block, validate_tx);
 
             // Execute in a scope to ensure EVM is dropped before any potential async operations
+            let replay_t = std::time::Instant::now();
             let (result, needs_update) = {
                 let mut evm = context.with_db(&mut db).build_op();
                 let res = evm.replay();
                 let needs_update = evm.0.db_mut().state.needs_update();
                 (res, needs_update)
             };
+            replay_total_ms += replay_t.elapsed().as_secs_f64() * 1000.0;
 
             if result.is_ok() || !needs_update {
                 break result.map(|res| (res.result, mem::take(&mut db.state.accounts)));
             }
         };
+
+        // Every millisecond of the loop is one of: waiting on an upstream fetch,
+        // running the EVM, or neither (bookkeeping). Reported together so the
+        // three are comparable without correlating spans.
+        let loop_ms = loop_t.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            iterations = iteration,
+            fetches,
+            fetch_total_ms,
+            fetch_max_ms,
+            replay_total_ms,
+            loop_ms,
+            other_ms = loop_ms - fetch_total_ms - replay_total_ms,
+            prefetch_ms,
+            prefetch_ok,
+            prefetch_err = %prefetch_err,
+            // discovered/discover_ms against fetches/fetch_total_ms is the
+            // whole scorecard for the batching: if discovery is working,
+            // `fetches` collapses towards zero and `fetch_total_ms` with it,
+            // while discover_ms stays at roughly the cost of one round trip.
+            discovered,
+            discover_ms,
+            "evm transact loop"
+        );
 
         tx_res.map_err(|err| EvmError::Generic(format!("generic: {err}")))
     }

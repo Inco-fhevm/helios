@@ -1,13 +1,13 @@
 use clap::Parser;
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 use helios_verifiable_api_server::server::{Network, VerifiableApiServer};
+use helios_verifiable_api_server::telemetry;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    // Pre setup
-    enable_tracing();
+    // Pre setup. Installs OTLP export + the W3C propagator when OTLP_ENDPOINT
+    // is set, otherwise plain stdout logging exactly as before.
+    telemetry::init("verifiable-api");
 
     // parse CLI arguments
     let cli = Cli::parse();
@@ -18,18 +18,6 @@ async fn main() {
     server.start().await.unwrap();
 }
 
-fn enable_tracing() {
-    let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env()
-        .expect("invalid env filter");
-
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(env_filter)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("subscriber set failed");
-}
 
 #[derive(Parser)]
 #[command(version, about)]
