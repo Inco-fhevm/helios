@@ -202,15 +202,40 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
         tx: &N::TransactionRequest,
         validate_tx: bool,
     ) -> Result<()> {
+        // Split because the caller only ever saw the total. Measured:
+        // vapi_execution_hint 748ms, of which the HTTP call accounted for
+        // to_headers 363 + body_read 302 + parse 0.15 = 665 -- leaving ~83ms
+        // unattributed on this side of the call. That is either the request
+        // construction ahead of the send or the insertion loop below, and until
+        // both are timed there is no way to tell which.
+        use tracing::Instrument;
+
+        let t_call = std::time::Instant::now();
         let account_map = self
             .execution
             .get_execution_hint(tx, validate_tx, self.block.into())
+            .instrument(tracing::info_span!("evm.hint_call"))
             .await
             .map_err(EvmError::RpcError)?;
+        let hint_call_ms = t_call.elapsed().as_secs_f64() * 1000.0;
 
-        for (address, account) in account_map {
-            self.accounts.insert(address, account);
+        let t_ins = std::time::Instant::now();
+        let mut inserted = 0usize;
+        {
+            let _g = tracing::info_span!("evm.hint_insert").entered();
+            for (address, account) in account_map {
+                self.accounts.insert(address, account);
+                inserted += 1;
+            }
         }
+        let hint_insert_ms = t_ins.elapsed().as_secs_f64() * 1000.0;
+
+        tracing::info!(
+            hint_call_ms,
+            hint_insert_ms,
+            accounts_inserted = inserted,
+            "evm prefetch_state"
+        );
 
         Ok(())
     }
