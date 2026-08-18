@@ -114,19 +114,42 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Account
         with_code: bool,
         block_id: BlockId,
     ) -> Result<Account> {
+        // Mirrors the spans on the raw-RPC provider so the two execution paths
+        // can be compared hop for hop. Without these, everything the vapi path
+        // does collapses into the single `helios.rpc` span and ~70% of an ACL
+        // check is unattributable -- which is exactly what happened when the
+        // vapi arm showed a 565ms call we could only explain 135ms of.
+        use tracing::Instrument;
+
         let block = self
             .get_block(block_id, false)
+            .instrument(tracing::info_span!("helios.get_block"))
             .await?
             .ok_or(eyre!("block not found"))?;
 
         let block_id = BlockId::number(block.header().number());
         let slots = slots.iter().map(|s| (*s).into()).collect::<Vec<U256>>();
-        let account = self
-            .api
-            .get_account(address, &slots, Some(block_id), with_code)
-            .await?;
+        // One HTTP call to the vapi server; replaces get_proof + get_code on
+        // the raw path, so compare it against the sum of those two.
+        let account = async {
+            self.api
+                .get_account(address, &slots, Some(block_id), with_code)
+                .await
+        }
+        .instrument(tracing::info_span!(
+            "helios.vapi_get_account",
+            slots = slots.len(),
+            with_code
+        ))
+        .await?;
 
-        self.verify_account(address, &account, &block)?;
+        // Local keccak/RLP over the returned trie path -- no await inside, so
+        // entered rather than instrumented. This is the part that must stay in
+        // the enclave for the vapi server to remain untrusted.
+        {
+            let _v = tracing::info_span!("helios.verify_account").entered();
+            self.verify_account(address, &account, &block)?;
+        }
         Ok(account)
     }
 }
@@ -393,19 +416,33 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Executi
         validate: bool,
         block_id: BlockId,
     ) -> Result<HashMap<Address, Account>> {
+        // The whole point of the vapi path: one call that runs the EVM
+        // server-side and returns every touched account, instead of ~12 serial
+        // fetches from inside the enclave. Spanning it separately from the
+        // verification loop says whether the remaining cost is the round trip,
+        // the server's EVM execution, or our own proof checking.
+        use tracing::Instrument;
+
         let block = self
             .get_block(block_id, false)
+            .instrument(tracing::info_span!("helios.get_block"))
             .await?
             .ok_or(eyre!("block not found"))?;
 
         let block_id = block.header().hash().into();
-        let ExtendedAccessListResponse { accounts } = self
-            .api
-            .get_execution_hint(tx.clone(), validate, Some(block_id))
-            .await?;
+        let ExtendedAccessListResponse { accounts } = async {
+            self.api
+                .get_execution_hint(tx.clone(), validate, Some(block_id))
+                .await
+        }
+        .instrument(tracing::info_span!("helios.vapi_execution_hint", validate))
+        .await?;
 
-        for (address, account) in &accounts {
-            self.verify_account(*address, account, &block)?;
+        {
+            let _v = tracing::info_span!("helios.verify_hint", accounts = accounts.len()).entered();
+            for (address, account) in &accounts {
+                self.verify_account(*address, account, &block)?;
+            }
         }
 
         Ok(accounts)

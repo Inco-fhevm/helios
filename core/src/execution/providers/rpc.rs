@@ -516,6 +516,57 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Executi
         _validate: bool,
         block_id: BlockId,
     ) -> Result<HashMap<Address, Account>> {
+        // Resolving the touched-account set is now a separate step so a caching
+        // wrapper can reuse it and fetch the accounts through its own cache. The
+        // behaviour here is unchanged: same list, same parallel chunked fetch.
+        let list = self
+            .resolve_execution_access_list(tx, block_id)
+            .await?
+            .unwrap_or_default();
+
+        let mut account_map = HashMap::new();
+        for chunk in list.chunks(PARALLEL_QUERY_BATCH_SIZE) {
+            let account_chunk_futs = chunk.iter().map(|account| {
+                let account_fut =
+                    self.get_account(account.address, &account.storage_keys, true, block_id);
+                async move { (account.address, account_fut.await) }
+            });
+
+            let account_chunk = join_all(account_chunk_futs).await;
+
+            for (address, value) in account_chunk {
+                let account = value?;
+                account_map.insert(address, account);
+            }
+        }
+
+        Ok(account_map)
+    }
+
+    async fn get_execution_access_list(
+        &self,
+        tx: &N::TransactionRequest,
+        block_id: BlockId,
+    ) -> Result<Option<Vec<AccessListItem>>> {
+        self.resolve_execution_access_list(tx, block_id).await
+    }
+}
+
+impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>>
+    RpcExecutionProvider<N, B, H>
+{
+    /// The access list for `tx`, plus the three accounts the EVM always touches but
+    /// which `eth_createAccessList` does not report: the sender, the recipient and
+    /// the block's beneficiary.
+    ///
+    /// Lifted out of `get_execution_hint` verbatim so the caching wrapper can ask
+    /// "which accounts?" without also being handed "and here is their state,
+    /// fetched uncached".
+    async fn resolve_execution_access_list(
+        &self,
+        tx: &N::TransactionRequest,
+        block_id: BlockId,
+    ) -> Result<Option<Vec<AccessListItem>>> {
         let block = self
             .get_block(block_id, false)
             .await?
@@ -554,22 +605,6 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Executi
             list.push(producer_access_entry)
         }
 
-        let mut account_map = HashMap::new();
-        for chunk in list.chunks(PARALLEL_QUERY_BATCH_SIZE) {
-            let account_chunk_futs = chunk.iter().map(|account| {
-                let account_fut =
-                    self.get_account(account.address, &account.storage_keys, true, block_id);
-                async move { (account.address, account_fut.await) }
-            });
-
-            let account_chunk = join_all(account_chunk_futs).await;
-
-            for (address, value) in account_chunk {
-                let account = value?;
-                account_map.insert(address, account);
-            }
-        }
-
-        Ok(account_map)
+        Ok(Some(list))
     }
 }
