@@ -48,7 +48,12 @@ pub struct TraceInjectService<S> {
 
 impl<S> Service<RequestPacket> for TraceInjectService<S>
 where
-    S: Service<RequestPacket, Response = ResponsePacket, Error = TransportError, Future = TransportFut<'static>>,
+    S: Service<
+        RequestPacket,
+        Response = ResponsePacket,
+        Error = TransportError,
+        Future = TransportFut<'static>,
+    >,
 {
     type Response = ResponsePacket;
     type Error = TransportError;

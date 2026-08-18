@@ -1,5 +1,9 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
+use alloy::transports::{http::Http, utils::guess_local_url};
 use alloy::{
     consensus::BlockHeader,
     eips::{BlockId, BlockNumberOrTag},
@@ -66,16 +70,63 @@ pub struct RpcExecutionProvider<N: NetworkSpec, B: BlockProvider<N>, H: Historic
     historical_provider: Option<H>,
 }
 
+/// Builds the HTTP client the execution RPC calls travel on.
+///
+/// An ACL check fans out into roughly a dozen state calls. On a fresh connection
+/// each one pays DNS, the TCP handshake and the TLS handshake before the answer
+/// starts; on a connection that already exists it pays the round trip only. The
+/// difference is large: measured from the mainnet hosts, a cold call costs 84 ms
+/// (Limburg) and 115 ms (Gravelines) against 18 ms and 20 ms warm. Alloy's
+/// default transport leaves these settings unset, so the pool is not kept warm
+/// between calls and the fan-out cannot share one connection.
+///
+/// The settings match the sibling `HttpVerifiableApi` client, with one
+/// deliberate difference: HTTP/2 is left to ALPN instead of being forced. The
+/// upstream is `http://localhost:8545` in the standard deployment, and forcing
+/// prior knowledge would break a plain HTTP/1.1 upstream.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        // Keep connections ready per upstream, and keep them indefinitely: the
+        // fan-out is bursty, so an idle timeout would throw away exactly the
+        // connections the next request needs.
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(None)
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        // Hold the HTTP/2 connection open through idle gaps, so a pooled
+        // connection is still usable when the next check arrives.
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(30))
+        .http2_keep_alive_while_idle(true)
+        // Resolve in process and cache to the record TTL. The mesh resolver
+        // answers over the same relayed path as the RPC call, at 7 ms to 26 ms
+        // per lookup, and nothing between it and the caller caches.
+        .hickory_dns(true)
+        .build()
+        .expect("building the execution RPC HTTP client")
+}
+
 /// Builds the upstream RPC client. On native targets outbound requests carry the
 /// active span's trace context, so the upstream's own spans continue the caller's
-/// trace rather than starting new ones.
+/// trace rather than starting new ones, and they travel on a pooled transport.
+#[cfg(not(target_arch = "wasm32"))]
 fn build_rpc_client(rpc_url: Url) -> RpcClient {
-    let builder = ClientBuilder::default().layer(RetryBackoffLayer::new(100, 50, 300));
+    let is_local = guess_local_url(rpc_url.as_str());
 
-    #[cfg(not(target_arch = "wasm32"))]
-    let builder = builder.layer(super::trace::TraceInjectLayer);
+    ClientBuilder::default()
+        .layer(RetryBackoffLayer::new(100, 50, 300))
+        .layer(super::trace::TraceInjectLayer)
+        .transport(Http::with_client(build_http_client(), rpc_url), is_local)
+}
 
-    builder.http(rpc_url)
+/// Builds the upstream RPC client. The browser owns the connection pool, so wasm
+/// keeps alloy's default transport.
+#[cfg(target_arch = "wasm32")]
+fn build_rpc_client(rpc_url: Url) -> RpcClient {
+    ClientBuilder::default()
+        .layer(RetryBackoffLayer::new(100, 50, 300))
+        .http(rpc_url)
 }
 
 impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> ExecutionProvider<N>
