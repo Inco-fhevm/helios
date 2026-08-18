@@ -293,14 +293,48 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Account
             .await?
             .ok_or(eyre!("block not found"))?;
 
-        let proof = async {
-            self.provider
-                .get_proof(address, slots.to_vec())
-                .block_id(block.header().hash().into())
-                .await
-        }
-        .instrument(tracing::info_span!("helios.get_proof", slots = slots.len()))
-        .await?;
+        // Proof and code are fetched CONCURRENTLY, not one after the other.
+        //
+        // Awaiting the proof first and only then the code made every account a
+        // chain of two WAN round trips, and because the accounts themselves run
+        // in parallel that showed up as two distinct waves in a trace: the
+        // proofs all starting at t+0 and finishing by t+40, then the code
+        // fetches starting at t+40 and running to t+117. The second wave was
+        // ~76ms of a ~226ms read, and it existed only because of the await
+        // order.
+        //
+        // get_code_at needs nothing from the proof. Only two things do: the
+        // DECISION to fetch (skip when code_hash is empty) and the
+        // VERIFICATION. So the fetch is fired speculatively alongside the
+        // proof, and once the proof lands the result is either verified or
+        // thrown away.
+        //
+        // Cost: one wasted eth_getCode for every EOA, which have no code. That
+        // is a request we would not otherwise make, traded for removing a
+        // serial round trip from every contract account.
+        //
+        // Safety: unchanged. The speculative body is never used without
+        // verify_code_hash_proof against the proof we just verified against the
+        // consensus state root, and it is discarded outright when the account
+        // turns out to have no code.
+        let (proof, speculative_code) = tokio::join!(
+            async {
+                self.provider
+                    .get_proof(address, slots.to_vec())
+                    .block_id(block.header().hash().into())
+                    .await
+            }
+            .instrument(tracing::info_span!("helios.get_proof", slots = slots.len())),
+            async {
+                if with_code {
+                    Some(self.provider.get_code_at(address).await)
+                } else {
+                    None
+                }
+            }
+            .instrument(tracing::info_span!("helios.get_code", speculative = true)),
+        );
+        let proof = proof?;
 
         // Synchronous keccak/RLP over the trie path. Entered rather than
         // instrumented because there is no await inside.
@@ -312,11 +346,22 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Account
 
         let code = if with_code {
             if proof.code_hash == KECCAK_EMPTY || proof.code_hash == B256::ZERO {
+                // No code at this address: the speculative fetch was wasted.
+                // Drop it rather than let an empty/garbage body reach the EVM.
                 Some(Bytes::new())
             } else {
-                let code = async { self.provider.get_code_at(address).await }
-                    .instrument(tracing::info_span!("helios.get_code"))
-                    .await?;
+                // Only surface a fetch error here, on the path that actually
+                // needs the code -- an error on an account that turns out to be
+                // an EOA must not fail the request.
+                let code = match speculative_code {
+                    Some(result) => result?,
+                    // with_code was true, so the future above always produced
+                    // Some. Kept explicit rather than unwrap so a future change
+                    // to that branch fails loudly instead of panicking.
+                    None => async { self.provider.get_code_at(address).await }
+                        .instrument(tracing::info_span!("helios.get_code", speculative = false))
+                        .await?,
+                };
                 let _v = tracing::info_span!("helios.verify_code").entered();
                 verify_code_hash_proof(&proof, &code)?;
                 Some(code)
