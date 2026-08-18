@@ -233,7 +233,7 @@ impl<N: NetworkSpec> BlockProvider<N> for BlockCache<N> {
 mod tests {
     use super::*;
     use alloy::network::Network;
-    use alloy::primitives::{B64, B256};
+    use alloy::primitives::{B256, B64};
     use helios_ethereum::spec::Ethereum;
 
     /// Clone a real block from testdata and re-stamp its identity. `salt` lets a
@@ -354,7 +354,9 @@ mod tests {
         let b101 = block(101, b100.header.hash, 1);
         cache.push_block(b100.clone(), at(100)).await;
         cache.push_block(b101.clone(), at(101)).await;
-        cache.push_block(block(101, b100.header.hash, 2), at(101)).await;
+        cache
+            .push_block(block(101, b100.header.hash, 2), at(101))
+            .await;
         assert!(
             !cache.hashes.read().await.contains_key(&b101.header.hash),
             "the abandoned block must not remain addressable by hash"

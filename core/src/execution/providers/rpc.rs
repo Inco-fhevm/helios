@@ -358,9 +358,11 @@ impl<N: NetworkSpec, B: BlockProvider<N>, H: HistoricalBlockProvider<N>> Account
                     // with_code was true, so the future above always produced
                     // Some. Kept explicit rather than unwrap so a future change
                     // to that branch fails loudly instead of panicking.
-                    None => async { self.provider.get_code_at(address).await }
-                        .instrument(tracing::info_span!("helios.get_code", speculative = false))
-                        .await?,
+                    None => {
+                        async { self.provider.get_code_at(address).await }
+                            .instrument(tracing::info_span!("helios.get_code", speculative = false))
+                            .await?
+                    }
                 };
                 let _v = tracing::info_span!("helios.verify_code").entered();
                 verify_code_hash_proof(&proof, &code)?;
