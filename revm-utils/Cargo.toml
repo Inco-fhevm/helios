@@ -7,6 +7,7 @@ description = "Utilities for integrating REVM with Helios"
 [dependencies]
 alloy.workspace = true 
 eyre.workspace = true 
+futures.workspace = true 
 hex.workspace = true 
 revm.workspace = true 
 tracing.workspace = true

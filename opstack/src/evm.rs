@@ -79,10 +79,43 @@ impl<E: ExecutionProvider<OpStack>> OpStackEvm<E> {
         let prefetch_res = db.state.prefetch_state(tx, validate_tx).await;
         let prefetch_ms = prefetch_t.elapsed().as_secs_f64() * 1000.0;
         let prefetch_ok = prefetch_res.is_ok();
+        // Measured: prefetch_ok was false in 80/80 samples while the underlying
+        // HTTP call returned 200 with a 134 KB body. The hint is fetched, paid
+        // for, and then discarded -- so the reason has to be visible, not just
+        // the fact of failure.
         let prefetch_err = match prefetch_res {
             Ok(()) => String::new(),
             Err(e) => format!("{e}"),
         };
+
+        // Discovery pass: find the whole working set in one replay, then fetch
+        // it concurrently, so the serial loop below has nothing left to do.
+        //
+        // The loop that follows can only ever learn about one missing account
+        // per iteration -- EvmState::access is a single Option and revm's
+        // Database trait is synchronous, so a miss has to abort the whole
+        // transaction, fetch one account, and replay from scratch. With the
+        // execution hint leaving ~8 accounts unpredicted that measured as eight
+        // strictly serial (WAN fetch + full re-execution) cycles: t+560, 604,
+        // 684, 723, 778, 816, 862, 902 ms, ~340ms of a ~508ms request.
+        //
+        // SAFETY: `discover` makes the getters return zeroed placeholders
+        // instead of aborting, so this replay executes against values that are
+        // wrong. Its result is dropped on the floor here and never inspected.
+        // Only the real loop below can produce the value we return, and it
+        // still fetches and verifies everything it uses. `access` is cleared
+        // afterwards so a placeholder miss cannot leak into it.
+        let discover_t = std::time::Instant::now();
+        db.state.discover = true;
+        {
+            let context = self.get_context(tx, &block, validate_tx);
+            let mut evm = context.with_db(&mut db).build_op();
+            let _discarded = evm.replay();
+        }
+        db.state.discover = false;
+        db.state.access = None;
+        let discovered = db.state.fetch_discovered().await.unwrap_or(0);
+        let discover_ms = discover_t.elapsed().as_secs_f64() * 1000.0;
 
         // Track iterations for debugging
         let mut iteration: u32 = 0;
@@ -162,6 +195,12 @@ impl<E: ExecutionProvider<OpStack>> OpStackEvm<E> {
             prefetch_ms,
             prefetch_ok,
             prefetch_err = %prefetch_err,
+            // discovered/discover_ms against fetches/fetch_total_ms is the
+            // whole scorecard for the batching: if discovery is working,
+            // `fetches` collapses towards zero and `fetch_total_ms` with it,
+            // while discover_ms stays at roughly the cost of one round trip.
+            discovered,
+            discover_ms,
             "evm transact loop"
         );
 
