@@ -5,7 +5,7 @@ use eyre::Result;
 use futures::future::join_all;
 use reqwest::{Client, ClientBuilder};
 use tokio::{sync::mpsc::Sender, time::sleep};
-use tracing::warn;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::SequencerCommitment;
@@ -17,22 +17,39 @@ pub fn start(urls: Vec<Url>, signer: Address, chain_id: u64, sender: Sender<Sequ
             .build()
             .unwrap();
 
-        let mut final_urls = Vec::new();
-        for url in urls {
-            if let Ok(replica_chain_id) = get_chain_id(&client, &url).await {
-                if chain_id == replica_chain_id {
-                    final_urls.push(url);
-                } else {
-                    warn!("received bad chain id from {}", url);
-                }
-            } else {
-                warn!("received no chain id from {}", url);
-            }
-        }
+        // Replicas are verified lazily and retried every iteration. Checking
+        // once at startup dropped a replica for the life of the process
+        // whenever that single 500ms request failed (e.g. the Service had no
+        // ready endpoints yet during a node replacement), leaving the pod on
+        // gossip alone and serving `null` for hours.
+        let mut pending: Vec<Url> = urls;
+        let mut verified: Vec<Url> = Vec::new();
+        let mut warned = false;
 
         loop {
+            if !pending.is_empty() {
+                let mut still_pending = Vec::new();
+                for url in pending {
+                    match get_chain_id(&client, &url).await {
+                        Ok(replica_chain_id) if replica_chain_id == chain_id => {
+                            info!("replica verified: {}", url);
+                            verified.push(url);
+                        }
+                        Ok(_) => warn!("received bad chain id from {}", url),
+                        Err(_) => {
+                            if !warned {
+                                warn!("received no chain id from {}, will retry", url);
+                            }
+                            still_pending.push(url);
+                        }
+                    }
+                }
+                warned = !still_pending.is_empty();
+                pending = still_pending;
+            }
+
             join_all(
-                final_urls
+                verified
                     .iter()
                     .map(|url| get_commitment(&client, url, sender.clone(), signer, chain_id)),
             )
