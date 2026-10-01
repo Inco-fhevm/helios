@@ -4,52 +4,46 @@ use alloy::primitives::Address;
 use eyre::Result;
 use futures::future::join_all;
 use reqwest::{Client, ClientBuilder};
-use tokio::{sync::mpsc::Sender, time::sleep};
-use tracing::{info, warn};
-use url::Url;
+use tokio::{net::lookup_host, sync::mpsc::Sender, time::sleep};
+use tracing::info;
+use url::{Host, Url};
 
 use crate::SequencerCommitment;
 
+/// Polls `/latest` on every replica twice a second and forwards each verified
+/// commitment to the server.
+///
+/// An `http` replica URL whose host is a DNS name is resolved again on every
+/// iteration, and each address it returns is polled on its own. Pointed at a
+/// headless Service, this reaches every sibling pod, including pods started
+/// after this one. A URL that does not resolve is polled as written.
+///
+/// There is no separate chain-id handshake: `SequencerCommitment::verify`
+/// checks the sequencer signature over a message bound to `chain_id`, so a
+/// commitment from another chain is rejected there.
 pub fn start(urls: Vec<Url>, signer: Address, chain_id: u64, sender: Sender<SequencerCommitment>) {
+    if urls.is_empty() {
+        return;
+    }
+
     tokio::spawn(async move {
         let client = ClientBuilder::new()
             .timeout(Duration::from_millis(500))
             .build()
             .unwrap();
 
-        // Replicas are verified lazily and retried every iteration. Checking
-        // once at startup dropped a replica for the life of the process
-        // whenever that single 500ms request failed (e.g. the Service had no
-        // ready endpoints yet during a node replacement), leaving the pod on
-        // gossip alone and serving `null` for hours.
-        let mut pending: Vec<Url> = urls;
-        let mut verified: Vec<Url> = Vec::new();
-        let mut warned = false;
+        let mut polled: Vec<Url> = Vec::new();
 
         loop {
-            if !pending.is_empty() {
-                let mut still_pending = Vec::new();
-                for url in pending {
-                    match get_chain_id(&client, &url).await {
-                        Ok(replica_chain_id) if replica_chain_id == chain_id => {
-                            info!("replica verified: {}", url);
-                            verified.push(url);
-                        }
-                        Ok(_) => warn!("received bad chain id from {}", url),
-                        Err(_) => {
-                            if !warned {
-                                warn!("received no chain id from {}, will retry", url);
-                            }
-                            still_pending.push(url);
-                        }
-                    }
-                }
-                warned = !still_pending.is_empty();
-                pending = still_pending;
+            let targets = resolve_all(&urls).await;
+            if targets != polled {
+                let list: Vec<&str> = targets.iter().map(Url::as_str).collect();
+                info!("polling replicas: {}", list.join(", "));
+                polled = targets;
             }
 
             join_all(
-                verified
+                polled
                     .iter()
                     .map(|url| get_commitment(&client, url, sender.clone(), signer, chain_id)),
             )
@@ -57,6 +51,45 @@ pub fn start(urls: Vec<Url>, signer: Address, chain_id: u64, sender: Sender<Sequ
             sleep(Duration::from_millis(500)).await;
         }
     });
+}
+
+async fn resolve_all(urls: &[Url]) -> Vec<Url> {
+    let mut targets = Vec::new();
+    for url in urls {
+        targets.extend(resolve(url).await);
+    }
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// Expands `url` into one URL per address its host resolves to. Only `http`
+/// URLs are expanded: an `https` URL rewritten to an IP would fail TLS
+/// hostname verification.
+async fn resolve(url: &Url) -> Vec<Url> {
+    let (Some(Host::Domain(name)), Some(port)) = (url.host(), url.port_or_known_default()) else {
+        return vec![url.clone()];
+    };
+    if url.scheme() != "http" {
+        return vec![url.clone()];
+    }
+
+    let Ok(addrs) = lookup_host((name, port)).await else {
+        return vec![url.clone()];
+    };
+    let resolved: Vec<Url> = addrs
+        .filter_map(|addr| {
+            let mut target = url.clone();
+            target.set_ip_host(addr.ip()).ok()?;
+            Some(target)
+        })
+        .collect();
+
+    if resolved.is_empty() {
+        vec![url.clone()]
+    } else {
+        resolved
+    }
 }
 
 async fn get_commitment(
@@ -80,13 +113,49 @@ async fn get_commitment(
     Ok(())
 }
 
-async fn get_chain_id(client: &Client, url: &Url) -> Result<u64> {
-    let chain_id = client
-        .get(url.join("chain_id")?)
-        .send()
-        .await?
-        .json::<u64>()
-        .await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Ok(chain_id)
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ip_url_is_kept() {
+        let u = url("http://10.0.0.7:8080/");
+        assert_eq!(resolve(&u).await, vec![u]);
+    }
+
+    #[tokio::test]
+    async fn https_url_is_kept() {
+        let u = url("https://localhost:8080/");
+        assert_eq!(resolve(&u).await, vec![u]);
+    }
+
+    #[tokio::test]
+    async fn dns_name_expands_to_every_address() {
+        let resolved = resolve(&url("http://localhost:8080/")).await;
+        assert!(!resolved.is_empty());
+        for target in &resolved {
+            assert!(matches!(
+                target.host(),
+                Some(Host::Ipv4(_)) | Some(Host::Ipv6(_))
+            ));
+            assert_eq!(target.port(), Some(8080));
+            assert_eq!(target.path(), "/");
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolvable_name_is_kept() {
+        let u = url("http://replica.invalid:8080/");
+        assert_eq!(resolve(&u).await, vec![u]);
+    }
+
+    #[tokio::test]
+    async fn targets_are_deduplicated() {
+        let u = url("http://10.0.0.7:8080/");
+        assert_eq!(resolve_all(&[u.clone(), u.clone()]).await, vec![u]);
+    }
 }
