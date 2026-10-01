@@ -57,7 +57,7 @@ impl ConsensusClient {
             let mut interval = interval(Duration::from_secs(1));
             loop {
                 if let Err(e) = inner.advance().await {
-                    error!(target: "helios::linea", "failed to advance: {}", e);
+                    error!(target: "helios::linea", "failed to advance: {:#}", e);
                 }
                 interval.tick().await;
             }
